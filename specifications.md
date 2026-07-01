@@ -69,6 +69,26 @@
   - ADR:
   - Commits: commit::HEAD
 
+### NFR-0003
+- Category: performance
+- Status: implemented
+- Source: User request, 2026-07-01
+- Description: Startup should reduce wall-clock loading time by parallelizing dataset loading, tokenizer/config/GPU probing, prompt tokenization, and model loading when model settings are already explicit.
+- Acceptance criteria:
+  - Experiment files are loaded through configurable data workers.
+  - Prompt rendering and token counting are performed through configurable tokenization workers.
+  - Tokenizer loading, raw data loading, GPU probing, and model config probing are started concurrently.
+  - vLLM model loading can overlap with data preparation only when explicit sizing options make it safe to start before prompt statistics are known.
+- Traceability:
+  - Code: run_inference.py::load_raw_experiments
+  - Code: run_inference.py::materialize_experiments
+  - Code: run_inference.py::can_overlap_model_loading
+  - Code: run_inference.py::main
+  - Tests: python_compile::run_inference.py
+  - Docs: README.md
+  - ADR:
+  - Commits: commit::HEAD
+
 ## Assumptions
 
 ### ASM-0001
@@ -93,7 +113,9 @@
 - REQ-0001 -> run_inference.py::run_experiment -> python_compile::run_inference.py -> commit::HEAD
 - NFR-0001 -> run_inference.py::build_llm -> python_compile::run_inference.py -> commit::HEAD
 - NFR-0002 -> run_inference.py::generate_budget_sweep_reuse_longest -> python_compile::run_inference.py -> commit::HEAD
+- NFR-0003 -> run_inference.py::main -> python_compile::run_inference.py -> commit::HEAD
 
 ## Change Log
 - 2026-07-01 - Initial offline vLLM reachability inference runner.
 - 2026-07-01 - Added deterministic reuse-longest budget sweep to reduce repeated long-context GPU prefill.
+- 2026-07-01 - Added parallel startup pipeline for data, tokenizer, config, GPU probes, and optional model loading overlap.

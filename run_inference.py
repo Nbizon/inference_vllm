@@ -13,6 +13,7 @@ import random
 import re
 import subprocess
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Any
 
@@ -71,6 +72,13 @@ class PromptTask:
     messages: list[dict[str, str]]
     prompt_text: str
     prompt_tokens: int
+
+
+@dataclass(frozen=True)
+class RawExperiment:
+    path: pathlib.Path
+    system_prompt: str
+    question_lines: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -241,6 +249,15 @@ def infer_model_context(model: str, trust_remote_code: bool) -> int | None:
     return max(candidates) if candidates else None
 
 
+def load_tokenizer(args):
+    from transformers import AutoTokenizer
+
+    return AutoTokenizer.from_pretrained(
+        args.tokenizer or args.model,
+        trust_remote_code=args.trust_remote_code,
+    )
+
+
 def visible_cuda_device_count(default: int) -> int:
     visible = os.getenv("CUDA_VISIBLE_DEVICES")
     if not visible or visible.strip() in {"", "-1"}:
@@ -377,7 +394,7 @@ def count_tokens(tokenizer, text: str) -> int:
         return len(tokenizer.encode(text))
 
 
-def load_experiment(path: pathlib.Path, tokenizer, args) -> Experiment | None:
+def load_raw_experiment(path: pathlib.Path) -> RawExperiment | None:
     system_path = path / "system.txt"
     questions_path = path / "reachability_questions.txt"
     if not system_path.is_file() or not questions_path.is_file():
@@ -385,10 +402,20 @@ def load_experiment(path: pathlib.Path, tokenizer, args) -> Experiment | None:
 
     system_prompt = read_text(system_path)
     lines = [line for line in read_text(questions_path).splitlines() if line.strip()]
+    if not lines:
+        return None
+    return RawExperiment(
+        path=path,
+        system_prompt=system_prompt,
+        question_lines=tuple(lines),
+    )
+
+
+def materialize_experiment(raw: RawExperiment, tokenizer, args) -> Experiment | None:
     tasks: list[PromptTask] = []
-    for seq_id, line in enumerate(lines):
+    for seq_id, line in enumerate(raw.question_lines):
         distance, question = parse_question_line(line)
-        messages = build_messages(system_prompt, question)
+        messages = build_messages(raw.system_prompt, question)
         prompt_text = render_chat_prompt(
             tokenizer,
             messages,
@@ -408,7 +435,7 @@ def load_experiment(path: pathlib.Path, tokenizer, args) -> Experiment | None:
         )
     if not tasks:
         return None
-    return Experiment(path=path, tasks=tasks)
+    return Experiment(path=raw.path, tasks=tasks)
 
 
 def iter_experiment_dirs(work_dir: pathlib.Path, contexts: set[int]) -> list[pathlib.Path]:
@@ -428,24 +455,70 @@ def iter_experiment_dirs(work_dir: pathlib.Path, contexts: set[int]) -> list[pat
     ]
 
 
-def prepare_experiments(tokenizer, args) -> list[Experiment]:
-    contexts = set(args.context or [])
-    experiments: list[Experiment] = []
-    for path in tqdm(iter_experiment_dirs(args.work_dir, contexts), desc="Preparing prompts", unit="exp"):
-        experiment = load_experiment(path, tokenizer, args)
-        if experiment is not None:
-            experiments.append(experiment)
-    if not experiments:
-        raise RuntimeError("No non-empty experiments were found.")
-    experiments.sort(key=lambda item: item.max_prompt_tokens, reverse=True)
+def load_raw_experiments(paths: list[pathlib.Path], workers: int) -> list[RawExperiment]:
+    if workers <= 1:
+        raw = [load_raw_experiment(path) for path in tqdm(paths, desc="Loading data", unit="exp")]
+        return [item for item in raw if item is not None]
+
+    experiments: list[RawExperiment] = []
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = [executor.submit(load_raw_experiment, path) for path in paths]
+        for future in tqdm(as_completed(futures), total=len(futures), desc="Loading data", unit="exp"):
+            item = future.result()
+            if item is not None:
+                experiments.append(item)
+    experiments.sort(key=lambda item: item.path.name)
     return experiments
 
 
-def resolve_runtime_settings(args, stats: PromptStats, gpu: GPUInfo) -> RuntimeSettings:
+def materialize_experiments(raw_experiments: list[RawExperiment], tokenizer, args) -> list[Experiment]:
+    workers = max(1, args.tokenize_workers)
+    if workers <= 1:
+        experiments = [
+            materialize_experiment(raw, tokenizer, args)
+            for raw in tqdm(raw_experiments, desc="Tokenizing prompts", unit="exp")
+        ]
+    else:
+        experiments = []
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = [
+                executor.submit(materialize_experiment, raw, tokenizer, args)
+                for raw in raw_experiments
+            ]
+            for future in tqdm(
+                as_completed(futures),
+                total=len(futures),
+                desc="Tokenizing prompts",
+                unit="exp",
+            ):
+                experiments.append(future.result())
+
+    ready = [item for item in experiments if item is not None]
+    if not ready:
+        raise RuntimeError("No non-empty experiments were found.")
+    ready.sort(key=lambda item: item.max_prompt_tokens, reverse=True)
+    return ready
+
+
+def prepare_experiments(tokenizer, args, raw_experiments: list[RawExperiment] | None = None) -> list[Experiment]:
+    contexts = set(args.context or [])
+    if raw_experiments is None:
+        paths = iter_experiment_dirs(args.work_dir, contexts)
+        raw_experiments = load_raw_experiments(paths, max(1, args.data_workers))
+    return materialize_experiments(raw_experiments, tokenizer, args)
+
+
+def resolve_runtime_settings(
+    args,
+    stats: PromptStats,
+    gpu: GPUInfo,
+    model_context: int | None = None,
+) -> RuntimeSettings:
     max_budget = max(args.reasoning_budgets)
     output_room = max_budget + args.answer_max_tokens + args.safety_margin_tokens
     needed_len = round_up_to_multiple(stats.max_prompt + output_room, 1024 if stats.max_prompt < 65_536 else 4096)
-    model_context = infer_model_context(args.model, args.trust_remote_code)
+    if model_context is None:
+        model_context = infer_model_context(args.model, args.trust_remote_code)
 
     requested = args.max_model_len.lower()
     if requested in {"needed", "fit", "prompt"}:
@@ -509,6 +582,65 @@ def resolve_runtime_settings(args, stats: PromptStats, gpu: GPUInfo) -> RuntimeS
         enable_prefix_caching=enable_prefix_caching,
         enable_chunked_prefill=enable_chunked_prefill,
         max_cudagraph_capture_size=capture_size,
+    )
+
+
+def startup_worker_count(requested: int, default_cap: int = 8) -> int:
+    if requested > 0:
+        return requested
+    return max(1, min(os.cpu_count() or 1, default_cap))
+
+
+def is_int_string(value: str) -> bool:
+    try:
+        int(value)
+    except ValueError:
+        return False
+    return True
+
+
+def can_overlap_model_loading(args) -> bool:
+    if args.startup_overlap_model == "off":
+        return False
+    if args.startup_overlap_model == "on":
+        return True
+    return (
+        is_int_string(args.max_model_len)
+        and args.max_num_seqs > 0
+        and args.max_num_batched_tokens > 0
+        and args.gpu_memory_utilization is not None
+        and args.prefix_caching != "auto"
+        and args.chunked_prefill != "auto"
+        and args.max_cudagraph_capture_size is not None
+    )
+
+
+def resolve_overlap_runtime_settings(args) -> RuntimeSettings:
+    if not is_int_string(args.max_model_len):
+        raise ValueError(
+            "--startup-overlap-model requires an integer --max-model-len so vLLM can start before prompt stats are known."
+        )
+    if args.max_num_seqs <= 0 or args.max_num_batched_tokens <= 0:
+        raise ValueError(
+            "--startup-overlap-model requires explicit --max-num-seqs and --max-num-batched-tokens."
+        )
+    if args.gpu_memory_utilization is None:
+        raise ValueError("--startup-overlap-model requires explicit --gpu-memory-utilization.")
+    if args.prefix_caching == "auto" or args.chunked_prefill == "auto":
+        raise ValueError(
+            "--startup-overlap-model requires --prefix-caching on/off and --chunked-prefill on/off."
+        )
+    if args.max_cudagraph_capture_size is None:
+        raise ValueError("--startup-overlap-model requires explicit --max-cudagraph-capture-size.")
+
+    return RuntimeSettings(
+        max_model_len=int(args.max_model_len),
+        max_num_seqs=args.max_num_seqs,
+        max_num_batched_tokens=args.max_num_batched_tokens,
+        gpu_memory_utilization=round(args.gpu_memory_utilization, 3),
+        enable_prefix_caching=bool_auto(args.prefix_caching, auto=True),
+        enable_chunked_prefill=bool_auto(args.chunked_prefill, auto=True),
+        max_cudagraph_capture_size=args.max_cudagraph_capture_size,
     )
 
 
@@ -904,20 +1036,56 @@ def main(args) -> None:
         )
     args.output_root.mkdir(parents=True, exist_ok=True)
 
-    gpu = detect_gpu_info()
-    logger.info("GPU=%s profile=%s count=%s min_total=%.1fGB", gpu.label, gpu.profile, gpu.count, gpu.total_memory_gb)
+    args.data_workers = startup_worker_count(args.data_workers)
+    args.tokenize_workers = startup_worker_count(args.tokenize_workers)
+    contexts = set(args.context or [])
+    experiment_paths = iter_experiment_dirs(args.work_dir, contexts)
 
-    from transformers import AutoTokenizer
+    startup_started = time.perf_counter()
+    llm_future = None
+    overlap_settings: RuntimeSettings | None = None
+    with ThreadPoolExecutor(max_workers=max(4, args.startup_workers)) as executor:
+        raw_future = executor.submit(load_raw_experiments, experiment_paths, args.data_workers)
+        tokenizer_future = executor.submit(load_tokenizer, args)
+        gpu_future = executor.submit(detect_gpu_info)
+        model_context_future = executor.submit(
+            infer_model_context,
+            args.model,
+            args.trust_remote_code,
+        )
 
-    tokenizer_started = time.perf_counter()
-    tokenizer = AutoTokenizer.from_pretrained(
-        args.tokenizer or args.model,
-        trust_remote_code=args.trust_remote_code,
-    )
-    logger.info("Tokenizer loaded in %.2fs", time.perf_counter() - tokenizer_started)
+        if can_overlap_model_loading(args):
+            overlap_settings = resolve_overlap_runtime_settings(args)
+            logger.info(
+                "Starting vLLM model loading in parallel with data preparation. "
+                "Settings must be explicit in this mode: %s",
+                overlap_settings,
+            )
+            llm_future = executor.submit(build_llm, args, overlap_settings)
+        else:
+            logger.info(
+                "Model loading will start after prompt stats are known. "
+                "Use --startup-overlap-model on with explicit vLLM settings to overlap it."
+            )
 
-    prep_started = time.perf_counter()
-    experiments = prepare_experiments(tokenizer, args)
+        tokenizer_started = time.perf_counter()
+        tokenizer = tokenizer_future.result()
+        logger.info("Tokenizer loaded in %.2fs", time.perf_counter() - tokenizer_started)
+
+        raw_started = time.perf_counter()
+        raw_experiments = raw_future.result()
+        logger.info(
+            "Loaded %s raw experiments in %.2fs with %s data workers",
+            len(raw_experiments),
+            time.perf_counter() - raw_started,
+            args.data_workers,
+        )
+
+        prep_started = time.perf_counter()
+        experiments = prepare_experiments(tokenizer, args, raw_experiments)
+        model_context = model_context_future.result()
+        gpu = gpu_future.result()
+
     all_prompt_lengths = [task.prompt_tokens for experiment in experiments for task in experiment.tasks]
     stats = prompt_stats(all_prompt_lengths)
     logger.info(
@@ -930,10 +1098,30 @@ def main(args) -> None:
         stats.p99,
         stats.max_prompt,
     )
+    logger.info(
+        "GPU=%s profile=%s count=%s min_total=%.1fGB",
+        gpu.label,
+        gpu.profile,
+        gpu.count,
+        gpu.total_memory_gb,
+    )
 
-    settings = resolve_runtime_settings(args, stats, gpu)
+    if overlap_settings is not None:
+        settings = overlap_settings
+        required_len = stats.max_prompt + max(args.reasoning_budgets) + args.answer_max_tokens + args.safety_margin_tokens
+        if required_len > settings.max_model_len:
+            raise ValueError(
+                f"Configured --max-model-len={settings.max_model_len} is too small for observed prompts; "
+                f"required at least {required_len}."
+            )
+    else:
+        settings = resolve_runtime_settings(args, stats, gpu, model_context=model_context)
     logger.info("Runtime settings: %s", settings)
-    llm = build_llm(args, settings)
+    if llm_future is not None:
+        llm = llm_future.result()
+    else:
+        llm = build_llm(args, settings)
+    logger.info("Startup completed in %.2fs", time.perf_counter() - startup_started)
 
     total_runs = sum(len(exp.tasks) for exp in experiments) * len(args.reasoning_budgets)
     with tqdm(total=total_runs, desc="All runs", unit="run") as pbar:
@@ -992,6 +1180,33 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--optimization-profile", choices=["throughput", "latency"], default="latency")
     parser.add_argument("--schedule", choices=["off", "longest_first", "largest_work_first"], default="largest_work_first")
     parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument(
+        "--data-workers",
+        type=int,
+        default=0,
+        help="Workers for parallel system/question file loading. 0 auto-tunes from CPU count.",
+    )
+    parser.add_argument(
+        "--tokenize-workers",
+        type=int,
+        default=0,
+        help="Workers for prompt rendering and token counting. 0 auto-tunes from CPU count.",
+    )
+    parser.add_argument(
+        "--startup-workers",
+        type=int,
+        default=4,
+        help="Thread pool size for startup tasks such as data loading, tokenizer loading, GPU probing, and config probing.",
+    )
+    parser.add_argument(
+        "--startup-overlap-model",
+        choices=["auto", "on", "off"],
+        default="auto",
+        help=(
+            "Start vLLM model loading while data/tokenization work is still running. Auto only "
+            "does this when all vLLM sizing options are explicit; on requires explicit settings."
+        ),
+    )
     parser.add_argument("--autosave-every", type=int, default=32)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--safety-margin-tokens", type=int, default=DEFAULT_SAFETY_MARGIN_TOKENS)

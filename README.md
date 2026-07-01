@@ -36,3 +36,30 @@ Pour les longs prompts, `--budget-sweep-mode reuse_longest` génère le
 raisonnement une seule fois au budget maximal, puis reconstruit les budgets plus
 petits en tronquant les tokens générés. Ce mode exige `--temperature 0` et garde
 `--budget-sweep-mode independent` disponible comme baseline de comparaison.
+
+## Démarrage parallèle
+
+Le runner charge les fichiers d'expériences, le tokenizer, la configuration
+modèle et les informations GPU en parallèle. Les workers sont contrôlés par:
+
+```bash
+--data-workers 8 --tokenize-workers 8 --startup-workers 4
+```
+
+Le chargement du modèle vLLM peut aussi être chevauché avec la préparation des
+prompts quand les dimensions vLLM sont explicites:
+
+```bash
+--startup-overlap-model on \
+--max-model-len 210000 \
+--max-num-seqs 1 \
+--max-num-batched-tokens 65536 \
+--gpu-memory-utilization 0.92 \
+--prefix-caching on \
+--chunked-prefill on \
+--max-cudagraph-capture-size 512
+```
+
+En mode `auto`, ce chevauchement n'est activé que lorsque ces réglages sont déjà
+explicites, afin de ne pas court-circuiter les heuristiques basées sur les
+longueurs de prompts.
