@@ -63,3 +63,34 @@ prompts quand les dimensions vLLM sont explicites:
 En mode `auto`, ce chevauchement n'est activé que lorsque ces réglages sont déjà
 explicites, afin de ne pas court-circuiter les heuristiques basées sur les
 longueurs de prompts.
+
+## Serveur vLLM basique
+
+Pour démarrer un serveur `vllm serve`, attendre qu'il soit prêt, lancer quelques
+exemples du dataset, puis arrêter le serveur:
+
+```bash
+python3 run_vllm_server_basic.py \
+  --work-dir /path/to/dataset \
+  --model /path/to/model \
+  --served-model-name local-model \
+  --limit 3 \
+  --max-tokens 256
+```
+
+Options utiles:
+
+```bash
+--context 100 \
+--max-model-len 210000 \
+--tensor-parallel-size 1 \
+--gpu-memory-utilization 0.92 \
+--enable-prefix-caching \
+--enable-chunked-prefill \
+--output-jsonl outputs/basic_examples.jsonl
+```
+
+Le script lit le premier dossier contenant `system.txt` et
+`reachability_questions.txt`, envoie les exemples à `/v1/chat/completions`, et
+écrit les réponses sur stdout. Utilise `--keep-server` pour ne pas arrêter vLLM
+après les exemples.

@@ -28,6 +28,25 @@
   - ADR:
   - Commits: commit::HEAD
 
+### REQ-0002
+- Status: implemented
+- Source: User request, 2026-07-01
+- Description: Provide a basic script that starts a vLLM OpenAI-compatible server and runs simple inference on examples from the benchmark dataset.
+- Acceptance criteria:
+  - The script starts `vllm serve` with configurable model, host, port, dtype, tensor parallelism, and context options.
+  - The script waits for `/v1/models` before sending inference requests.
+  - The script reads examples from `system.txt` and `reachability_questions.txt`.
+  - The script sends examples to `/v1/chat/completions` and prints the answers.
+  - The script stops the vLLM server by default and can keep it running when requested.
+- Traceability:
+  - Code: run_vllm_server_basic.py::start_server
+  - Code: run_vllm_server_basic.py::wait_until_ready
+  - Code: run_vllm_server_basic.py::run_one_chat
+  - Tests: python_compile::run_vllm_server_basic.py
+  - Docs: README.md
+  - ADR:
+  - Commits: commit::HEAD
+
 ## Non-Functional Requirements
 
 ### NFR-0001
@@ -111,6 +130,7 @@
 
 ## Traceability Index
 - REQ-0001 -> run_inference.py::run_experiment -> python_compile::run_inference.py -> commit::HEAD
+- REQ-0002 -> run_vllm_server_basic.py::main -> python_compile::run_vllm_server_basic.py -> commit::HEAD
 - NFR-0001 -> run_inference.py::build_llm -> python_compile::run_inference.py -> commit::HEAD
 - NFR-0002 -> run_inference.py::generate_budget_sweep_reuse_longest -> python_compile::run_inference.py -> commit::HEAD
 - NFR-0003 -> run_inference.py::main -> python_compile::run_inference.py -> commit::HEAD
@@ -119,3 +139,4 @@
 - 2026-07-01 - Initial offline vLLM reachability inference runner.
 - 2026-07-01 - Added deterministic reuse-longest budget sweep to reduce repeated long-context GPU prefill.
 - 2026-07-01 - Added parallel startup pipeline for data, tokenizer, config, GPU probes, and optional model loading overlap.
+- 2026-07-01 - Added a basic vLLM server launcher and example inference script.
