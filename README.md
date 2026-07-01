@@ -22,6 +22,8 @@ python3 run_inference.py \
   --model /path/to/model \
   --output-root outputs/run_1 \
   --reasoning-budgets 512,1024,2048 \
+  --temperature 0 \
+  --budget-sweep-mode reuse_longest \
   --max-model-len needed \
   --tensor-parallel-size 1
 ```
@@ -29,3 +31,8 @@ python3 run_inference.py \
 Par défaut, le script charge le moteur vLLM une seule fois, pré-tokenise les
 prompts, active le prefix caching, active le chunked prefill, borne strictement
 les sorties, et écrit un `all_results.txt` par expérience.
+
+Pour les longs prompts, `--budget-sweep-mode reuse_longest` génère le
+raisonnement une seule fois au budget maximal, puis reconstruit les budgets plus
+petits en tronquant les tokens générés. Ce mode exige `--temperature 0` et garde
+`--budget-sweep-mode independent` disponible comme baseline de comparaison.

@@ -84,6 +84,12 @@ class BudgetTask:
 
 
 @dataclass(frozen=True)
+class GeneratedText:
+    text: str
+    token_ids: tuple[int, ...]
+
+
+@dataclass(frozen=True)
 class Experiment:
     path: pathlib.Path
     tasks: list[PromptTask]
@@ -469,7 +475,7 @@ def resolve_runtime_settings(args, stats: PromptStats, gpu: GPUInfo) -> RuntimeS
     if args.max_num_batched_tokens:
         max_num_batched_tokens = args.max_num_batched_tokens
     elif stats.p95 >= 128_000:
-        max_num_batched_tokens = 32_768
+        max_num_batched_tokens = 65_536
     elif stats.p95 >= 16_000:
         max_num_batched_tokens = 16_384
     else:
@@ -566,9 +572,36 @@ def sampling(max_tokens: int, args) -> SamplingParams:
     )
 
 
-def generate_texts(llm: LLM, prompts: list[str], params: SamplingParams) -> list[str]:
+def generate_outputs(llm: LLM, prompts: list[str], params: SamplingParams) -> list[GeneratedText]:
     outputs = llm.generate(prompts, params, use_tqdm=False)
-    return [(output.outputs[0].text if output.outputs else "").strip() for output in outputs]
+    generated: list[GeneratedText] = []
+    for output in outputs:
+        if not output.outputs:
+            generated.append(GeneratedText("", tuple()))
+            continue
+        completion = output.outputs[0]
+        token_ids = tuple(getattr(completion, "token_ids", ()) or ())
+        generated.append(GeneratedText((completion.text or "").strip(), token_ids))
+    return generated
+
+
+def generate_texts(llm: LLM, prompts: list[str], params: SamplingParams) -> list[str]:
+    return [output.text for output in generate_outputs(llm, prompts, params)]
+
+
+def decode_token_prefix(
+    tokenizer,
+    token_ids: tuple[int, ...],
+    max_tokens: int,
+    fallback_text: str,
+) -> str:
+    if token_ids:
+        return tokenizer.decode(
+            token_ids[:max_tokens],
+            skip_special_tokens=False,
+            clean_up_tokenization_spaces=False,
+        ).strip()
+    return fallback_text.strip()
 
 
 def generate_reasoning_then_answer(
@@ -604,6 +637,73 @@ def generate_reasoning_then_answer(
     return [
         (task, clean_reasoning(reasoning), answer.strip())
         for task, reasoning, answer in zip(tasks, reasonings, answers, strict=True)
+    ]
+
+
+def build_answer_prompt(tokenizer, prompt: PromptTask, reasoning: str, args) -> str:
+    messages = list(prompt.messages)
+    messages.append(reasoning_message(reasoning))
+    return render_chat_prompt(
+        tokenizer,
+        messages,
+        model=args.model,
+        enable_thinking=False,
+        add_generation_prompt=False,
+        continue_final_message=True,
+    )
+
+
+def generate_budget_sweep_reuse_longest(
+    *,
+    llm: LLM,
+    tokenizer,
+    prompt: PromptTask,
+    budgets: list[int],
+    args,
+    settings: RuntimeSettings,
+) -> list[tuple[int, str, str]]:
+    max_budget = max(budgets)
+    validate_task_fits_context(BudgetTask(prompt, max_budget), args, settings)
+
+    max_reasoning = generate_outputs(
+        llm,
+        [prompt.prompt_text],
+        sampling(max_budget, args),
+    )[0]
+
+    reasoning_by_budget = {
+        budget: clean_reasoning(
+            decode_token_prefix(tokenizer, max_reasoning.token_ids, budget, max_reasoning.text)
+        )
+        for budget in budgets
+    }
+
+    answer_jobs = [
+        (
+            budget,
+            build_answer_prompt(tokenizer, prompt, reasoning_by_budget[budget], args),
+        )
+        for budget in sorted(budgets, reverse=True)
+    ]
+    if args.answer_generation_mode == "sequential":
+        answers = [
+            generate_outputs(llm, [answer_prompt], sampling(args.answer_max_tokens, args))[0]
+            for _, answer_prompt in answer_jobs
+        ]
+    else:
+        answers = generate_outputs(
+            llm,
+            [answer_prompt for _, answer_prompt in answer_jobs],
+            sampling(args.answer_max_tokens, args),
+        )
+    answer_by_budget = {
+        budget: answer.text.strip()
+        for (budget, _), answer in zip(answer_jobs, answers, strict=True)
+    }
+
+    return [
+        (budget, reasoning_by_budget[budget], answer_by_budget.get(budget, ""))
+        for budget in budgets
     ]
 
 
@@ -678,6 +778,68 @@ def run_experiment(llm: LLM, tokenizer, experiment: Experiment, args, settings: 
     output_dir = args.output_root / experiment.path.name
     existing = load_existing_results(output_dir) if args.resume else {}
     results_by_key = dict(existing)
+
+    if args.budget_sweep_mode == "reuse_longest":
+        pending_prompts: list[tuple[PromptTask, list[int]]] = []
+        for prompt in experiment.tasks:
+            missing_budgets = [
+                budget
+                for budget in args.reasoning_budgets
+                if (prompt.seq_id, budget) not in existing
+            ]
+            if missing_budgets:
+                pending_prompts.append((prompt, missing_budgets))
+
+        pending_prompts.sort(key=lambda item: item[0].prompt_tokens, reverse=True)
+        if not pending_prompts:
+            write_results(output_dir, ordered_results(experiment, args.reasoning_budgets, results_by_key))
+            return
+
+        pending_runs = sum(len(budgets) for _, budgets in pending_prompts)
+        logger.info(
+            "Running %s: %s pending runs via reuse_longest over %s prompts",
+            experiment.path.name,
+            pending_runs,
+            len(pending_prompts),
+        )
+        for prompt, budgets in pending_prompts:
+            try:
+                sweep_results = generate_budget_sweep_reuse_longest(
+                    llm=llm,
+                    tokenizer=tokenizer,
+                    prompt=prompt,
+                    budgets=budgets,
+                    args=args,
+                    settings=settings,
+                )
+            except Exception:
+                logger.exception(
+                    "Prompt sweep failed in %s seq=%s; recording request errors",
+                    experiment.path.name,
+                    prompt.seq_id,
+                )
+                sweep_results = [
+                    (budget, "[REQUEST_ERROR] sweep failed", "[REQUEST_ERROR] sweep failed")
+                    for budget in budgets
+                ]
+
+            for budget, reasoning, answer in sweep_results:
+                results_by_key[(prompt.seq_id, budget)] = (
+                    prompt.seq_id,
+                    prompt.distance,
+                    budget,
+                    prompt.question,
+                    reasoning,
+                    answer,
+                )
+                global_pbar.update(1)
+
+            if args.autosave_every and len(results_by_key) % args.autosave_every < len(budgets):
+                write_results(output_dir, ordered_results(experiment, args.reasoning_budgets, results_by_key))
+
+        write_results(output_dir, ordered_results(experiment, args.reasoning_budgets, results_by_key))
+        return
+
     tasks = [
         task
         for task in ordered_budget_tasks(experiment, args.reasoning_budgets, args.schedule)
@@ -736,6 +898,10 @@ def ordered_results(
 def main(args) -> None:
     random.seed(args.seed)
     args.reasoning_budgets = parse_int_list(args.reasoning_budgets)
+    if args.budget_sweep_mode == "reuse_longest" and args.temperature != 0.0:
+        raise ValueError(
+            "--budget-sweep-mode reuse_longest requires --temperature 0.0 for exact deterministic prefix reuse."
+        )
     args.output_root.mkdir(parents=True, exist_ok=True)
 
     gpu = detect_gpu_info()
@@ -783,6 +949,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-root", type=pathlib.Path, required=True)
     parser.add_argument("--context", type=int, nargs="*", default=None)
     parser.add_argument("--reasoning-budgets", default=",".join(str(v) for v in DEFAULT_REASONING_BUDGETS))
+    parser.add_argument(
+        "--budget-sweep-mode",
+        choices=["independent", "reuse_longest"],
+        default="reuse_longest",
+        help=(
+            "reuse_longest generates reasoning once at the largest budget, then token-truncates "
+            "that deterministic generation for smaller budgets."
+        ),
+    )
+    parser.add_argument(
+        "--answer-generation-mode",
+        choices=["sequential", "batched"],
+        default="sequential",
+        help=(
+            "How reuse_longest generates final answers. Sequential preserves deterministic "
+            "stability best and still benefits from prefix cache; batched can be faster."
+        ),
+    )
     parser.add_argument("--answer-max-tokens", type=int, default=2048)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top-p", type=float, default=1.0)
